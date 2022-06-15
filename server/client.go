@@ -19,6 +19,8 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"github.com/nats-io/nats-server/v2/server/internal/network"
+	"github.com/nats-io/nats-server/v2/server/internal/network/websocket"
 	"io"
 	"math/rand"
 	"net"
@@ -52,6 +54,145 @@ const (
 	// ACCOUNT is for the internal client for accounts.
 	ACCOUNT
 )
+
+type UpgradeResult struct {
+	conn net.Conn
+	ws   *websocket.Websocket
+	kind int
+}
+
+func processRequestKind(r *http.Request) int {
+	kind := CLIENT
+	if r.URL != nil {
+		ep := r.URL.EscapedPath()
+		if strings.HasPrefix(ep, leafNodeWSPath) {
+			kind = LEAF
+		} else if strings.HasPrefix(ep, mqttWSPath) {
+			kind = MQTT
+		}
+	}
+	return kind
+}
+
+// Upgrade processes websocket client handshake. On success, returns the raw net.Conn that
+// will be used to create a *client object.
+// Invoked from the HTTP Server listening on websocket port.
+func Upgrade(w http.ResponseWriter, r *http.Request, srvWebsocket *websocket.SrvWebsocket, opts websocket.WebsocketOpts) (*UpgradeResult, error) {
+	kind := processRequestKind(r)
+
+	// From https://tools.ietf.org/html/rfc6455#section-4.2.1
+	// Point 1.
+	if r.Method != "GET" {
+		return nil, returnHTTPError(w, r, http.StatusMethodNotAllowed, "request method must be GET")
+	}
+	// Point 2.
+	if r.Host == _EMPTY_ {
+		return nil, returnHTTPError(w, r, http.StatusBadRequest, "'Host' missing in request")
+	}
+	// Point 3.
+	if !headerContains(r.Header, "Upgrade", "websocket") {
+		return nil, returnHTTPError(w, r, http.StatusBadRequest, "invalid value for header 'Upgrade'")
+	}
+	// Point 4.
+	if !headerContains(r.Header, "Connection", "Upgrade") {
+		return nil, returnHTTPError(w, r, http.StatusBadRequest, "invalid value for header 'Connection'")
+	}
+	// Point 5.
+	key := r.Header.Get("Sec-Websocket-Key")
+	if key == _EMPTY_ {
+		return nil, returnHTTPError(w, r, http.StatusBadRequest, "key missing")
+	}
+	// Point 6.
+	if !headerContains(r.Header, "Sec-Websocket-Version", "13") {
+		return nil, returnHTTPError(w, r, http.StatusBadRequest, "invalid version")
+	}
+	// Others are optional
+	// Point 7.
+	if err := srvWebsocket.CheckOrigin(r); err != nil {
+		return nil, returnHTTPError(w, r, http.StatusForbidden, fmt.Sprintf("origin not allowed: %v", err))
+	}
+	// Point 8.
+	// We don't have protocols, so ignore.
+	// Point 9.
+	// Extensions, only support for compression at the moment
+	compress := opts.Compression
+	if compress {
+		// Simply check if permessage-deflate extension is present.
+		compress, _ = websocket.PMCExtensionSupport(r.Header, true)
+	}
+	// We will do masking if asked (unless we reject for tests)
+	noMasking := r.Header.Get(websocket.NoMaskingHeader) == websocket.NoMaskingValue && !websocket.TestRejectNoMasking
+
+	h := w.(http.Hijacker)
+	conn, brw, err := h.Hijack()
+	if err != nil {
+		if conn != nil {
+			conn.Close()
+		}
+		return nil, returnHTTPError(w, r, http.StatusInternalServerError, err.Error())
+	}
+	if brw.Reader.Buffered() > 0 {
+		conn.Close()
+		return nil, returnHTTPError(w, r, http.StatusBadRequest, "client sent data before handshake is complete")
+	}
+
+	var buf [1024]byte
+	p := buf[:0]
+
+	// From https://tools.ietf.org/html/rfc6455#section-4.2.2
+	p = append(p, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "...)
+	p = append(p, acceptKey(key)...)
+	p = append(p, _CRLF_...)
+	if compress {
+		p = append(p, websocket.PMCFullResponse...)
+	}
+	if noMasking {
+		p = append(p, websocket.NoMaskingFullResponse...)
+	}
+	if kind == MQTT {
+		p = append(p, websocket.MQTTSecProto...)
+	}
+	p = append(p, _CRLF_...)
+
+	if _, err = conn.Write(p); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	// If there was a deadline set for the handshake, clear it now.
+	if opts.HandshakeTimeout > 0 {
+		conn.SetDeadline(time.Time{})
+	}
+	// Server always expect "clients" to send masked payload, unless the option
+	// "no-masking" has been enabled.
+	ws := &websocket.Websocket{Compress: compress, Maskread: !noMasking}
+
+	// Check for X-Forwarded-For header
+	if cips, ok := r.Header[websocket.XForwardedForHeader]; ok {
+		cip := cips[0]
+		if net.ParseIP(cip) != nil {
+			ws.ClientIP = cip
+		}
+	}
+
+	if kind == CLIENT || kind == MQTT {
+		// Indicate if this is likely coming from a browser.
+		if ua := r.Header.Get("User-Agent"); ua != _EMPTY_ && strings.HasPrefix(ua, "Mozilla/") {
+			ws.Browser = true
+			// Disable fragmentation of compressed frames for Safari browsers.
+			// Unfortunately, you could be running Chrome on macOS and this
+			// string will contain "Safari/" (along "Chrome/"). However, what
+			// I have found is that actual Safari browser also have "Version/".
+			// So make the combination of the two.
+			ws.Nocompfrag = ws.Compress && strings.Contains(ua, "Version/") && strings.Contains(ua, "Safari/")
+		}
+		if opts.JWTCookie != _EMPTY_ {
+			if c, err := r.Cookie(opts.JWTCookie); err == nil && c != nil {
+				ws.CookieJwt = c.Value
+			}
+		}
+	}
+	return &UpgradeResult{conn: conn, ws: ws, kind: kind}, nil
+}
 
 // Extended type of a CLIENT connection. This is returned by c.clientType()
 // and indicate what type of client connection we are dealing with.
@@ -236,7 +377,7 @@ type client struct {
 	pubKey     string
 	nc         net.Conn
 	ncs        atomic.Value
-	out        outbound
+	out        network.Outbound
 	user       *NkeyUser
 	host       string
 	port       uint16
@@ -254,11 +395,12 @@ type client struct {
 	rtt      time.Duration
 	rttStart time.Time
 
-	route *route
-	gw    *gateway
-	leaf  *leaf
-	ws    *websocket
-	mqtt  *mqtt
+	route           *route
+	gw              *gateway
+	leaf            *leaf
+	websocketClient *websocket.Client
+	//ws              *websocket.Websocket
+	mqtt *mqtt
 
 	flags clientFlag // Compact booleans into a single field. Size will be increased when needed.
 
@@ -576,12 +718,12 @@ func (c *client) initClient() {
 	c.cid = atomic.AddUint64(&s.gcid, 1)
 
 	// Outbound data structure setup
-	c.out.sz = startBufSize
-	c.out.sg = sync.NewCond(&(c.mu))
+	c.out.Sz = startBufSize
+	c.out.Sg = sync.NewCond(&(c.mu))
 	opts := s.getOpts()
 	// Snapshots to avoid mutex access in fast paths.
-	c.out.wdl = opts.WriteDeadline
-	c.out.mp = opts.MaxPending
+	c.out.Wdl = opts.WriteDeadline
+	c.out.Mp = opts.MaxPending
 	// Snapshot max control line since currently can not be changed on reload and we
 	// were checking it on each call to parse. If this changes and we allow MaxControlLine
 	// to be reloaded without restart, this code will need to change.
@@ -613,8 +755,8 @@ func (c *client) initClient() {
 				host, port, _ := net.SplitHostPort(conn)
 				iPort, _ := strconv.Atoi(port)
 				c.host, c.port = host, uint16(iPort)
-				if c.isWebsocket() && c.ws.clientIP != _EMPTY_ {
-					cip := c.ws.clientIP
+				if c.isWebsocket() && c.websocketClient.Ws.ClientIP != _EMPTY_ {
+					cip := c.websocketClient.Ws.ClientIP
 					// Surround IPv6 addresses with square brackets, as
 					// net.JoinHostPort would do...
 					if strings.Contains(cip, ":") {
@@ -1058,9 +1200,9 @@ func (c *client) writeLoop() {
 	for {
 		c.mu.Lock()
 		if closed = c.isClosed(); !closed {
-			owtf := c.out.fsp > 0 && c.out.pb < maxBufSize && c.out.fsp < maxFlushPending
-			if waitOk && (c.out.pb == 0 || owtf) {
-				c.out.sg.Wait()
+			owtf := c.out.Fsp > 0 && c.out.Pb < maxBufSize && c.out.Fsp < maxFlushPending
+			if waitOk && (c.out.Pb == 0 || owtf) {
+				c.out.Sg.Wait()
 				// Check that connection has not been closed while lock was released
 				// in the conditional wait.
 				closed = c.isClosed()
@@ -1102,7 +1244,7 @@ func (c *client) flushClients(budget time.Duration) time.Time {
 		// Update last activity for message delivery
 		cp.last = last
 		// Remove ourselves from the pending list.
-		cp.out.fsp--
+		cp.out.Fsp--
 
 		// Just ignore if this was closed.
 		if cp.isClosed() {
@@ -1110,8 +1252,8 @@ func (c *client) flushClients(budget time.Duration) time.Time {
 			continue
 		}
 
-		if budget > 0 && cp.out.lft < 2*budget && cp.flushOutbound() {
-			budget -= cp.out.lft
+		if budget > 0 && cp.out.Lft < 2*budget && cp.flushOutbound() {
+			budget -= cp.out.Lft
 		} else {
 			cp.flushSignal()
 		}
@@ -1147,7 +1289,7 @@ func (c *client) readLoop(pre []byte) {
 	acc := c.acc
 	var masking bool
 	if ws {
-		masking = c.ws.maskread
+		masking = c.websocketClient.Ws.Maskread
 	}
 	c.mu.Unlock()
 
@@ -1170,10 +1312,10 @@ func (c *client) readLoop(pre []byte) {
 	var _bufs [1][]byte
 	bufs := _bufs[:1]
 
-	var wsr *wsReadInfo
+	var wsr *websocket.ReadInfo
 	if ws {
-		wsr = &wsReadInfo{mask: masking}
-		wsr.init()
+		wsr = &websocket.ReadInfo{Mask: masking}
+		wsr.Init()
 	}
 
 	for {
@@ -1194,7 +1336,7 @@ func (c *client) readLoop(pre []byte) {
 			}
 		}
 		if ws {
-			bufs, err = c.wsRead(wsr, nc, b[:n])
+			bufs, err = c.websocketClient.Read(wsr, nc, b[:n])
 			if bufs == nil && err != nil {
 				if err != io.EOF {
 					c.Errorf("read error: %v", err)
@@ -1329,26 +1471,31 @@ func closedStateForErr(err error) ClosedState {
 // This will return a copy on purpose.
 func (c *client) collapsePtoNB() (net.Buffers, int64) {
 	if c.isWebsocket() {
-		return c.wsCollapsePtoNB()
+		b, i, err := c.websocketClient.CollapsePtoNB()
+		if err != nil {
+			c.markConnAsClosed(WriteError)
+			return nil, 0
+		}
+		return b, i
 	}
-	if c.out.p != nil {
-		p := c.out.p
-		c.out.p = nil
-		return append(c.out.nb, p), c.out.pb
+	if c.out.P != nil {
+		p := c.out.P
+		c.out.P = nil
+		return append(c.out.Nb, p), c.out.Pb
 	}
-	return c.out.nb, c.out.pb
+	return c.out.Nb, c.out.Pb
 }
 
 // This will handle the fixup needed on a partial write.
 // Assume pending has been already calculated correctly.
 func (c *client) handlePartialWrite(pnb net.Buffers) {
 	if c.isWebsocket() {
-		c.ws.frames = append(pnb, c.ws.frames...)
+		c.websocketClient.Ws.Frames = append(pnb, c.websocketClient.Ws.Frames...)
 		return
 	}
 	nb, _ := c.collapsePtoNB()
 	// The partial needs to be first, so append nb to pnb
-	c.out.nb = append(pnb, nb...)
+	c.out.Nb = append(pnb, nb...)
 }
 
 // flushOutbound will flush outbound buffer to a client.
@@ -1368,13 +1515,13 @@ func (c *client) flushOutbound() bool {
 	defer c.flags.clear(flushOutbound)
 
 	// Check for nothing to do.
-	if c.nc == nil || c.srv == nil || c.out.pb == 0 {
+	if c.nc == nil || c.srv == nil || c.out.Pb == 0 {
 		return true // true because no need to queue a signal.
 	}
 
 	// Place primary on nb, assign primary to secondary, nil out nb and secondary.
 	nb, attempted := c.collapsePtoNB()
-	c.out.p, c.out.nb, c.out.s = c.out.s, nil, nil
+	c.out.P, c.out.Nb, c.out.S = c.out.S, nil, nil
 	if nb == nil {
 		return true
 	}
@@ -1388,10 +1535,10 @@ func (c *client) flushOutbound() bool {
 
 	// In case it goes away after releasing the lock.
 	nc := c.nc
-	apm := c.out.pm
+	apm := c.out.Pm
 
 	// Capture this (we change the value in some tests)
-	wdl := c.out.wdl
+	wdl := c.out.Wdl
 	// Do NOT hold lock during actual IO.
 	c.mu.Unlock()
 
@@ -1432,66 +1579,72 @@ func (c *client) flushOutbound() bool {
 	}
 
 	// Update flush time statistics.
-	c.out.lft = lft
+	c.out.Lft = lft
 
 	// Subtract from pending bytes and messages.
-	c.out.pb -= n
+	c.out.Pb -= n
 	if c.isWebsocket() {
-		c.ws.fs -= n
+		c.websocketClient.Ws.Fs -= n
 	}
-	c.out.pm -= apm // FIXME(dlc) - this will not be totally accurate on partials.
+	c.out.Pm -= apm // FIXME(dlc) - this will not be totally accurate on partials.
 
 	// Check for partial writes
 	// TODO(dlc) - zero write with no error will cause lost message and the writeloop to spin.
 	if n != attempted && n > 0 {
 		c.handlePartialWrite(nb)
-	} else if int32(n) >= c.out.sz {
-		c.out.sws = 0
+	} else if int32(n) >= c.out.Sz {
+		c.out.Sws = 0
 	}
 
 	// Adjust based on what we wrote plus any pending.
-	pt := n + c.out.pb
+	pt := n + c.out.Pb
 
 	// Adjust sz as needed downward, keeping power of 2.
 	// We do this at a slower rate.
-	if pt < int64(c.out.sz) && c.out.sz > minBufSize {
-		c.out.sws++
-		if c.out.sws > shortsToShrink {
-			c.out.sz >>= 1
+	if pt < int64(c.out.Sz) && c.out.Sz > minBufSize {
+		c.out.Sws++
+		if c.out.Sws > shortsToShrink {
+			c.out.Sz >>= 1
 		}
 	}
 	// Adjust sz as needed upward, keeping power of 2.
-	if pt > int64(c.out.sz) && c.out.sz < maxBufSize {
-		c.out.sz <<= 1
+	if pt > int64(c.out.Sz) && c.out.Sz < maxBufSize {
+		c.out.Sz <<= 1
 	}
 
 	// Check to see if we can reuse buffers.
 	if lfs != 0 && n >= int64(lfs) {
 		oldp := cnb[0][:0]
-		if cap(oldp) >= int(c.out.sz) {
+		if cap(oldp) >= int(c.out.Sz) {
 			// Replace primary or secondary if they are nil, reusing same buffer.
-			if c.out.p == nil {
-				c.out.p = oldp
-			} else if c.out.s == nil || cap(c.out.s) < int(c.out.sz) {
-				c.out.s = oldp
+			if c.out.P == nil {
+				c.out.P = oldp
+			} else if c.out.S == nil || cap(c.out.S) < int(c.out.Sz) {
+				c.out.S = oldp
 			}
 		}
 	}
 
 	// Check that if there is still data to send and writeLoop is in wait,
 	// then we need to signal.
-	if c.out.pb > 0 {
+	if c.out.Pb > 0 {
 		c.flushSignal()
 	}
 
 	// Check if we have a stalled gate and if so and we are recovering release
 	// any stalled producers. Only kind==CLIENT will stall.
-	if c.out.stc != nil && (n == attempted || c.out.pb < c.out.mp/2) {
-		close(c.out.stc)
-		c.out.stc = nil
+	if c.out.Stc != nil && (n == attempted || c.out.Pb < c.out.Mp/2) {
+		close(c.out.Stc)
+		c.out.Stc = nil
 	}
 
 	return true
+}
+
+// Returns true if this connection is from a Websocket client.
+// Lock held on entry.
+func (c *client) isWebsocket() bool {
+	return c.websocketClient != nil && c.websocketClient.Ws != nil
 }
 
 // This is invoked from flushOutbound() for io/timeout error (slow consumer).
@@ -1519,7 +1672,7 @@ func (c *client) handleWriteTimeout(written, attempted int64, numChunks int) boo
 	// Slow consumer here..
 	atomic.AddInt64(&c.srv.slowConsumers, 1)
 	c.Noticef("Slow Consumer Detected: WriteDeadline of %v exceeded with %d chunks of %d total bytes.",
-		c.out.wdl, numChunks, attempted)
+		c.out.Wdl, numChunks, attempted)
 
 	// We always close CLIENT connections, or when nothing was written at all...
 	if c.kind == CLIENT || written == 0 {
@@ -1554,9 +1707,9 @@ func (c *client) markConnAsClosed(reason ClosedState) {
 	}
 	c.flags.set(connMarkedClosed)
 	// For a websocket client, unless we are told not to flush, enqueue
-	// a websocket CloseMessage based on the reason.
-	if !skipFlush && c.isWebsocket() && !c.ws.closeSent {
-		c.wsEnqueueCloseMessage(reason)
+	// a websocket closeMessage based on the reason.
+	if !skipFlush && c.isWebsocket() && !c.websocketClient.Ws.CloseSent {
+		c.websocketClient.EnqueueCloseMessage(websocket.ClosedState(reason))
 	}
 	// Be consistent with the creation: for routes, gateways and leaf,
 	// we use Noticef on create, so use that too for delete.
@@ -1597,7 +1750,7 @@ func (c *client) markConnAsClosed(reason ClosedState) {
 // flushSignal will use server to queue the flush IO operation to a pool of flushers.
 // Lock must be held.
 func (c *client) flushSignal() {
-	c.out.sg.Signal()
+	c.out.Sg.Signal()
 }
 
 // Traces a message.
@@ -1790,9 +1943,11 @@ func (c *client) processConnect(arg []byte) error {
 	}
 
 	// If websocket client and JWT not in the CONNECT, use the cookie JWT (possibly empty).
-	if ws := c.ws; ws != nil && c.opts.JWT == "" {
-		c.opts.JWT = ws.cookieJwt
+	if c.isWebsocket() && c.opts.JWT == "" {
+		c.opts.JWT = c.websocketClient.Ws.CookieJwt
+
 	}
+
 	// when not in operator mode, discard the jwt
 	if srv != nil && srv.trustedKeys == nil {
 		c.opts.JWT = _EMPTY_
@@ -1971,46 +2126,46 @@ func (c *client) queueOutbound(data []byte) {
 	}
 
 	// Add to pending bytes total.
-	c.out.pb += int64(len(data))
+	c.out.Pb += int64(len(data))
 
 	// Check for slow consumer via pending bytes limit.
 	// ok to return here, client is going away.
-	if c.kind == CLIENT && c.out.pb > c.out.mp {
+	if c.kind == CLIENT && c.out.Pb > c.out.Mp {
 		// Perf wise, it looks like it is faster to optimistically add than
 		// checking current pb+len(data) and then add to pb.
-		c.out.pb -= int64(len(data))
+		c.out.Pb -= int64(len(data))
 		atomic.AddInt64(&c.srv.slowConsumers, 1)
-		c.Noticef("Slow Consumer Detected: MaxPending of %d Exceeded", c.out.mp)
+		c.Noticef("Slow Consumer Detected: MaxPending of %d Exceeded", c.out.Mp)
 		c.markConnAsClosed(SlowConsumerPendingBytes)
 		return
 	}
 
-	if c.out.p == nil && len(data) < maxBufSize {
-		if c.out.sz == 0 {
-			c.out.sz = startBufSize
+	if c.out.P == nil && len(data) < maxBufSize {
+		if c.out.Sz == 0 {
+			c.out.Sz = startBufSize
 		}
-		if c.out.s != nil && cap(c.out.s) >= int(c.out.sz) {
-			c.out.p = c.out.s
-			c.out.s = nil
+		if c.out.S != nil && cap(c.out.S) >= int(c.out.Sz) {
+			c.out.P = c.out.S
+			c.out.S = nil
 		} else {
 			// FIXME(dlc) - make power of 2 if less than maxBufSize?
-			c.out.p = make([]byte, 0, c.out.sz)
+			c.out.P = make([]byte, 0, c.out.Sz)
 		}
 	}
 	// Determine if we copy or reference
-	available := cap(c.out.p) - len(c.out.p)
+	available := cap(c.out.P) - len(c.out.P)
 	if len(data) > available {
 		// We can't fit everything into existing primary, but message will
 		// fit in next one we allocate or utilize from the secondary.
 		// So copy what we can.
-		if available > 0 && len(data) < int(c.out.sz) {
-			c.out.p = append(c.out.p, data[:available]...)
+		if available > 0 && len(data) < int(c.out.Sz) {
+			c.out.P = append(c.out.P, data[:available]...)
 			data = data[available:]
 		}
 		// Put the primary on the nb if it has a payload
-		if len(c.out.p) > 0 {
-			c.out.nb = append(c.out.nb, c.out.p)
-			c.out.p = nil
+		if len(c.out.P) > 0 {
+			c.out.Nb = append(c.out.Nb, c.out.P)
+			c.out.P = nil
 		}
 		// TODO: It was found with LeafNode and Websocket that referencing
 		// the data buffer when > maxBufSize would cause corruption
@@ -2018,30 +2173,30 @@ func (c *client) queueOutbound(data []byte) {
 		// So always make a copy for now.
 
 		// We will copy to primary.
-		if c.out.p == nil {
+		if c.out.P == nil {
 			// Grow here
-			if (c.out.sz << 1) <= maxBufSize {
-				c.out.sz <<= 1
+			if (c.out.Sz << 1) <= maxBufSize {
+				c.out.Sz <<= 1
 			}
-			if len(data) > int(c.out.sz) {
-				c.out.p = make([]byte, 0, len(data))
+			if len(data) > int(c.out.Sz) {
+				c.out.P = make([]byte, 0, len(data))
 			} else {
-				if c.out.s != nil && cap(c.out.s) >= int(c.out.sz) { // TODO(dlc) - Size mismatch?
-					c.out.p = c.out.s
-					c.out.s = nil
+				if c.out.S != nil && cap(c.out.S) >= int(c.out.Sz) { // TODO(dlc) - Size mismatch?
+					c.out.P = c.out.S
+					c.out.S = nil
 				} else {
-					c.out.p = make([]byte, 0, c.out.sz)
+					c.out.P = make([]byte, 0, c.out.Sz)
 				}
 			}
 		}
 	}
-	c.out.p = append(c.out.p, data...)
+	c.out.P = append(c.out.P, data...)
 
 	// Check here if we should create a stall channel if we are falling behind.
 	// We do this here since if we wait for consumer's writeLoop it could be
 	// too late with large number of fan in producers.
-	if c.out.pb > c.out.mp/2 && c.out.stc == nil {
-		c.out.stc = make(chan struct{})
+	if c.out.Pb > c.out.Mp/2 && c.out.Stc == nil {
+		c.out.Stc = make(chan struct{})
 	}
 }
 
@@ -3036,8 +3191,8 @@ func (c *client) msgHeader(subj, reply []byte, sub *subscription) []byte {
 }
 
 func (c *client) stalledWait(producer *client) {
-	stall := c.out.stc
-	ttl := stallDuration(c.out.pb, c.out.mp)
+	stall := c.out.Stc
+	ttl := stallDuration(c.out.Pb, c.out.Mp)
 	c.mu.Unlock()
 	defer c.mu.Lock()
 
@@ -3146,10 +3301,10 @@ func (c *client) deliverMsg(sub *subscription, acc *Account, subject, reply, mh,
 
 	// Update statistics
 
-	// The msg includes the CR_LF, so pull back out for accounting.
+	// The msg includes the cR_LF, so pull back out for accounting.
 	msgSize := int64(len(msg))
 	prodIsMQTT := c.isMqtt()
-	// MQTT producers send messages without CR_LF, so don't remove it for them.
+	// MQTT producers send messages without cR_LF, so don't remove it for them.
 	if !prodIsMQTT {
 		msgSize -= int64(LEN_CR_LF)
 	}
@@ -3184,7 +3339,7 @@ func (c *client) deliverMsg(sub *subscription, acc *Account, subject, reply, mh,
 	// If we are a client and we detect that the consumer we are
 	// sending to is in a stalled state, go ahead and wait here
 	// with a limit.
-	if c.kind == CLIENT && client.out.stc != nil {
+	if c.kind == CLIENT && client.out.Stc != nil {
 		client.stalledWait(c)
 	}
 
@@ -3227,11 +3382,11 @@ func (c *client) deliverMsg(sub *subscription, acc *Account, subject, reply, mh,
 	client.queueOutbound(mh)
 	client.queueOutbound(msg)
 	if prodIsMQTT {
-		// Need to add CR_LF since MQTT producers don't send CR_LF
+		// Need to add cR_LF since MQTT producers don't send cR_LF
 		client.queueOutbound([]byte(CR_LF))
 	}
 
-	client.out.pm++
+	client.out.Pm++
 
 	// If we are tracking dynamic publish permissions that track reply subjects,
 	// do that accounting here. We only look at client.replies which will be non-nil.
@@ -3247,7 +3402,7 @@ func (c *client) deliverMsg(sub *subscription, acc *Account, subject, reply, mh,
 	// to intervene before this producer goes back to top of readloop. We are in the producer's
 	// readloop go routine at this point.
 	// FIXME(dlc) - We may call this alot, maybe suppress after first call?
-	if client.out.pm > 1 && client.out.pb > maxBufSize*2 {
+	if client.out.Pm > 1 && client.out.Pb > maxBufSize*2 {
 		client.flushSignal()
 	}
 
@@ -3270,7 +3425,7 @@ func (c *client) deliverMsg(sub *subscription, acc *Account, subject, reply, mh,
 // if `client` is same than `c`.
 func (c *client) addToPCD(client *client) {
 	if _, ok := c.pcd[client]; !ok {
-		client.out.fsp++
+		client.out.Fsp++
 		c.pcd[client] = needFlush
 	}
 }
@@ -3511,7 +3666,7 @@ func (c *client) selectMappedSubject() bool {
 // due to a permission issue.
 func (c *client) processInboundClientMsg(msg []byte) (bool, bool) {
 	// Update statistics
-	// The msg includes the CR_LF, so pull back out for accounting.
+	// The msg includes the cR_LF, so pull back out for accounting.
 	c.in.msgs++
 	c.in.bytes += int32(len(msg) - LEN_CR_LF)
 
@@ -4571,18 +4726,18 @@ func (c *client) setExpirationTimer(d time.Duration) {
 // minimal write deadline.
 // Lock is held on entry.
 func (c *client) flushAndClose(minimalFlush bool) {
-	if !c.flags.isSet(skipFlushOnClose) && c.out.pb > 0 {
+	if !c.flags.isSet(skipFlushOnClose) && c.out.Pb > 0 {
 		if minimalFlush {
 			const lowWriteDeadline = 100 * time.Millisecond
 
 			// Reduce the write deadline if needed.
-			if c.out.wdl > lowWriteDeadline {
-				c.out.wdl = lowWriteDeadline
+			if c.out.Wdl > lowWriteDeadline {
+				c.out.Wdl = lowWriteDeadline
 			}
 		}
 		c.flushOutbound()
 	}
-	c.out.p, c.out.s = nil, nil
+	c.out.P, c.out.S = nil, nil
 
 	// Close the low level connection.
 	if c.nc != nil {
@@ -4717,9 +4872,9 @@ func (c *client) closeConnection(reason ClosedState) {
 	c.markConnAsClosed(reason)
 
 	// Unblock anyone who is potentially stalled waiting on us.
-	if c.out.stc != nil {
-		close(c.out.stc)
-		c.out.stc = nil
+	if c.out.Stc != nil {
+		close(c.out.Stc)
+		c.out.Stc = nil
 	}
 
 	var (

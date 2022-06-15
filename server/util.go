@@ -15,10 +15,14 @@ package server
 
 import (
 	"context"
+	"crypto/sha1"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"github.com/nats-io/nats-server/v2/server/internal/network/websocket"
 	"math"
 	"net"
+	"net/http"
 	"net/url"
 	"reflect"
 	"regexp"
@@ -27,10 +31,6 @@ import (
 	"time"
 )
 
-// This map is used to store URLs string as the key with a reference count as
-// the value. This is used to handle gossiped URLs such as connect_urls, etc..
-type refCountedUrlSet map[string]int
-
 // Ascii numbers 0-9
 const (
 	asciiZero = 48
@@ -38,6 +38,38 @@ const (
 )
 
 var semVerRe = regexp.MustCompile(`\Av?([0-9]+)\.?([0-9]+)?\.?([0-9]+)?`)
+
+// Returns true if the header named `name` contains a token with value `value`.
+func headerContains(header http.Header, name string, value string) bool {
+	for _, s := range header[name] {
+		tokens := strings.Split(s, ",")
+		for _, t := range tokens {
+			t = strings.Trim(t, " \t")
+			if strings.EqualFold(t, value) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// Send an HTTP error with the given `status`` to the given http response writer `w`.
+// Return an error created based on the `reason` string.
+func returnHTTPError(w http.ResponseWriter, r *http.Request, status int, reason string) error {
+	err := fmt.Errorf("%s - websocket handshake error: %s", r.RemoteAddr, reason)
+	w.Header().Set("Sec-Websocket-Version", "13")
+	http.Error(w, http.StatusText(status), status)
+	return err
+}
+
+// Concatenate the key sent by the client with the GUID, then computes the SHA1 hash
+// and returns it as a based64 encoded string.
+func acceptKey(key string) string {
+	h := sha1.New()
+	h.Write([]byte(key))
+	h.Write(websocket.GUID)
+	return base64.StdEncoding.EncodeToString(h.Sum(nil))
+}
 
 func versionComponents(version string) (major, minor, patch int, err error) {
 	m := semVerRe.FindStringSubmatch(version)
@@ -195,40 +227,6 @@ func comma(v int64) string {
 	}
 	parts[j] = strconv.Itoa(int(v))
 	return sign + strings.Join(parts[j:], ",")
-}
-
-// Adds urlStr to the given map. If the string was already present, simply
-// bumps the reference count.
-// Returns true only if it was added for the first time.
-func (m refCountedUrlSet) addUrl(urlStr string) bool {
-	m[urlStr]++
-	return m[urlStr] == 1
-}
-
-// Removes urlStr from the given map. If the string is not present, nothing
-// is done and false is returned.
-// If the string was present, its reference count is decreased. Returns true
-// if this was the last reference, false otherwise.
-func (m refCountedUrlSet) removeUrl(urlStr string) bool {
-	removed := false
-	if ref, ok := m[urlStr]; ok {
-		if ref == 1 {
-			removed = true
-			delete(m, urlStr)
-		} else {
-			m[urlStr]--
-		}
-	}
-	return removed
-}
-
-// Returns the unique URLs in this map as a slice
-func (m refCountedUrlSet) getAsStringSlice() []string {
-	a := make([]string, 0, len(m))
-	for u := range m {
-		a = append(a, u)
-	}
-	return a
 }
 
 // natsListenConfig provides a common configuration to match the one used by

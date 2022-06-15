@@ -19,6 +19,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"github.com/nats-io/nats-server/v2/server/internal/util"
 	"math/rand"
 	"net"
 	"net/url"
@@ -127,7 +128,7 @@ type srvGateway struct {
 	outo     []*client              // outbound gateways maintained in an order suitable for sending msgs (currently based on RTT)
 	in       map[uint64]*client     // inbound gateways
 	remotes  map[string]*gatewayCfg // Config of remote gateways
-	URLs     refCountedUrlSet       // Set of all Gateway URLs in the cluster
+	URLs     util.RefCountedUrlSet  // Set of all Gateway URLs in the cluster
 	URL      string                 // This server gateway URL (after possible random port is resolved)
 	info     *Info                  // Gateway Info protocol
 	infoJSON []byte                 // Marshal'ed Info protocol
@@ -301,7 +302,7 @@ func validateGatewayOptions(o *Options) error {
 			return fmt.Errorf("gateway %q has no URL", g.Name)
 		}
 	}
-	if err := validatePinnedCerts(o.Gateway.TLSPinnedCerts); err != nil {
+	if err := ValidatePinnedCerts(o.Gateway.TLSPinnedCerts); err != nil {
 		return fmt.Errorf("gateway %q: %v", o.Gateway.Name, err)
 	}
 	return nil
@@ -342,7 +343,7 @@ func (s *Server) newGateway(opts *Options) error {
 		outo:     make([]*client, 0, 4),
 		in:       make(map[uint64]*client),
 		remotes:  make(map[string]*gatewayCfg),
-		URLs:     make(refCountedUrlSet),
+		URLs:     make(util.RefCountedUrlSet),
 		resolver: opts.Gateway.resolver,
 		runknown: opts.Gateway.RejectUnknown,
 		oldHash:  getOldHash(opts.Gateway.Name),
@@ -549,7 +550,7 @@ func (s *Server) setGatewayInfoHostPort(info *Info, o *Options) error {
 	gw := s.gateway
 	gw.Lock()
 	defer gw.Unlock()
-	gw.URLs.removeUrl(gw.URL)
+	gw.URLs.RemoveUrl(gw.URL)
 	if o.Gateway.Advertise != "" {
 		advHost, advPort, err := parseHostPort(o.Gateway.Advertise, o.Gateway.Port)
 		if err != nil {
@@ -606,7 +607,7 @@ func (g *srvGateway) generateInfoJSON() {
 	if !g.enabled {
 		return
 	}
-	g.info.GatewayURLs = g.URLs.getAsStringSlice()
+	g.info.GatewayURLs = g.URLs.GetAsStringSlice()
 	b, err := json.Marshal(g.info)
 	if err != nil {
 		panic(err)
@@ -1544,7 +1545,7 @@ func (g *gatewayCfg) addURLs(infoURLs []string) {
 // Server lock held on entry
 func (s *Server) addGatewayURL(urlStr string) bool {
 	s.gateway.Lock()
-	added := s.gateway.URLs.addUrl(urlStr)
+	added := s.gateway.URLs.AddUrl(urlStr)
 	if added {
 		s.gateway.generateInfoJSON()
 	}
@@ -1560,7 +1561,7 @@ func (s *Server) removeGatewayURL(urlStr string) bool {
 		return false
 	}
 	s.gateway.Lock()
-	removed := s.gateway.URLs.removeUrl(urlStr)
+	removed := s.gateway.URLs.RemoveUrl(urlStr)
 	if removed {
 		s.gateway.generateInfoJSON()
 	}

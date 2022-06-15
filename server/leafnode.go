@@ -20,6 +20,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"github.com/nats-io/nats-server/v2/server/internal/network/websocket"
 	"io/ioutil"
 	"math/rand"
 	"net"
@@ -239,10 +240,10 @@ func validateLeafNode(o *Options) error {
 	// If a remote has a websocket scheme, all need to have it.
 	for _, rcfg := range o.LeafNode.Remotes {
 		if len(rcfg.URLs) >= 2 {
-			firstIsWS, ok := isWSURL(rcfg.URLs[0]), true
+			firstIsWS, ok := websocket.IsWebsocketURL(rcfg.URLs[0]), true
 			for i := 1; i < len(rcfg.URLs); i++ {
 				u := rcfg.URLs[i]
-				if isWS := isWSURL(u); isWS && !firstIsWS || !isWS && firstIsWS {
+				if isWS := websocket.IsWebsocketURL(u); isWS && !firstIsWS || !isWS && firstIsWS {
 					ok = false
 					break
 				}
@@ -276,7 +277,7 @@ func validateLeafNode(o *Options) error {
 	if o.SystemAccount == "" {
 		return fmt.Errorf("leaf nodes and gateways (both being defined) require a system account to also be configured")
 	}
-	if err := validatePinnedCerts(o.LeafNode.TLSPinnedCerts); err != nil {
+	if err := ValidatePinnedCerts(o.LeafNode.TLSPinnedCerts); err != nil {
 		return fmt.Errorf("leafnode: %v", err)
 	}
 	return nil
@@ -383,7 +384,7 @@ func newLeafNodeCfg(remote *RemoteLeafOpts) *leafNodeCfg {
 		cfg.saveUserPassword(u)
 		// If the url(s) have the "wss://" scheme, and we don't have a TLS
 		// config, mark that we should be using TLS anyway.
-		if !cfg.TLS && isWSSURL(u) {
+		if !cfg.TLS && websocket.IsWebsocketSecurityURL(u) {
 			cfg.TLS = true
 		}
 	}
@@ -719,7 +720,7 @@ func (s *Server) copyLeafNodeInfo() *Info {
 // Returns a boolean indicating if the URL was added or not.
 // Server lock is held on entry
 func (s *Server) addLeafNodeURL(urlStr string) bool {
-	if s.leafURLsMap.addUrl(urlStr) {
+	if s.leafURLsMap.AddUrl(urlStr) {
 		s.generateLeafNodeInfoJSON()
 		return true
 	}
@@ -736,7 +737,7 @@ func (s *Server) removeLeafNodeURL(urlStr string) bool {
 	if s.shutdown {
 		return false
 	}
-	if s.leafURLsMap.removeUrl(urlStr) {
+	if s.leafURLsMap.RemoveUrl(urlStr) {
 		s.generateLeafNodeInfoJSON()
 		return true
 	}
@@ -745,8 +746,8 @@ func (s *Server) removeLeafNodeURL(urlStr string) bool {
 
 // Server lock is held on entry
 func (s *Server) generateLeafNodeInfoJSON() {
-	s.leafNodeInfo.LeafNodeURLs = s.leafURLsMap.getAsStringSlice()
-	s.leafNodeInfo.WSConnectURLs = s.websocket.connectURLsMap.getAsStringSlice()
+	s.leafNodeInfo.LeafNodeURLs = s.leafURLsMap.GetAsStringSlice()
+	s.leafNodeInfo.WSConnectURLs = s.websocket.ConnectURLsMap.GetAsStringSlice()
 	b, _ := json.Marshal(s.leafNodeInfo)
 	pcs := [][]byte{[]byte("INFO"), b, []byte(CR_LF)}
 	s.leafNodeInfoJSON = bytes.Join(pcs, []byte(" "))
@@ -763,7 +764,7 @@ func (s *Server) sendAsyncLeafNodeInfo() {
 }
 
 // Called when an inbound leafnode connection is accepted or we create one for a solicited leafnode.
-func (s *Server) createLeafNode(conn net.Conn, rURL *url.URL, remote *leafNodeCfg, ws *websocket) *client {
+func (s *Server) createLeafNode(conn net.Conn, rURL *url.URL, remote *leafNodeCfg, ws *websocket.Websocket) *client {
 	// Snapshot server options.
 	opts := s.getOpts()
 
@@ -781,13 +782,18 @@ func (s *Server) createLeafNode(conn net.Conn, rURL *url.URL, remote *leafNodeCf
 
 	// For accepted LN connections, ws will be != nil if it was accepted
 	// through the Websocket port.
-	c.ws = ws
+	c.websocketClient = &websocket.Client{
+		Ws:  ws,
+		Mu:  &c.mu,
+		Nc:  c.nc,
+		Out: &c.out,
+	}
 
 	// For remote, check if the scheme starts with "ws", if so, we will initiate
 	// a remote Leaf Node connection as a websocket connection.
-	if remote != nil && rURL != nil && isWSURL(rURL) {
+	if remote != nil && rURL != nil && websocket.IsWebsocketURL(rURL) {
 		remote.RLock()
-		c.ws = &websocket{compress: remote.Websocket.Compression, maskwrite: !remote.Websocket.NoMasking}
+		c.websocketClient.Ws = &websocket.Websocket{Compress: remote.Websocket.Compression, Maskwrite: !remote.Websocket.NoMasking}
 		remote.RUnlock()
 	}
 
@@ -838,7 +844,7 @@ func (s *Server) createLeafNode(conn net.Conn, rURL *url.URL, remote *leafNodeCf
 	} else {
 		c.flags.set(expectConnect)
 		if ws != nil {
-			c.Debugf("Leafnode compression=%v", c.ws.compress)
+			c.Debugf("Leafnode compression=%v", c.websocketClient.Ws.Compress)
 		}
 	}
 	c.mu.Unlock()
@@ -1073,13 +1079,13 @@ func (c *client) updateLeafNodeURLs(info *Info) {
 
 	// We have ensured that if a remote has a WS scheme, then all are.
 	// So check if first is WS, then add WS URLs, otherwise, add non WS ones.
-	if len(cfg.URLs) > 0 && isWSURL(cfg.URLs[0]) {
+	if len(cfg.URLs) > 0 && websocket.IsWebsocketURL(cfg.URLs[0]) {
 		// It does not really matter if we use "ws://" or "wss://" here since
 		// we will have already marked that the remote should use TLS anyway.
 		// But use proper scheme for log statements, etc...
-		proto := wsSchemePrefix
+		proto := websocket.SchemePrefix
 		if cfg.TLS {
-			proto = wsSchemePrefixTLS
+			proto = websocket.SchemePrefixTLS
 		}
 		c.doUpdateLNURLs(cfg, proto, info.WSConnectURLs)
 		return
@@ -2172,7 +2178,7 @@ func (c *client) processLeafMsgArgs(arg []byte) error {
 // processInboundLeafMsg is called to process an inbound msg from a leaf node.
 func (c *client) processInboundLeafMsg(msg []byte) {
 	// Update statistics
-	// The msg includes the CR_LF, so pull back out for accounting.
+	// The msg includes the cR_LF, so pull back out for accounting.
 	c.in.msgs++
 	c.in.bytes += int32(len(msg) - LEN_CR_LF)
 
@@ -2389,7 +2395,7 @@ func (c *client) leafNodeSolicitWSConnection(opts *Options, rURL *url.URL, remot
 		Header:     make(http.Header),
 		Host:       u.Host,
 	}
-	wsKey, err := wsMakeChallengeKey()
+	wsKey, err := websocket.MakeChallengeKey()
 	if err != nil {
 		return nil, WriteError, err
 	}
@@ -2399,10 +2405,10 @@ func (c *client) leafNodeSolicitWSConnection(opts *Options, rURL *url.URL, remot
 	req.Header["Sec-WebSocket-Key"] = []string{wsKey}
 	req.Header["Sec-WebSocket-Version"] = []string{"13"}
 	if compress {
-		req.Header.Add("Sec-WebSocket-Extensions", wsPMCReqHeaderValue)
+		req.Header.Add("Sec-WebSocket-Extensions", websocket.PMCReqHeaderValue)
 	}
 	if noMasking {
-		req.Header.Add(wsNoMaskingHeader, wsNoMaskingValue)
+		req.Header.Add(websocket.NoMaskingHeader, websocket.NoMaskingValue)
 	}
 	if err := req.Write(c.nc); err != nil {
 		return nil, WriteError, err
@@ -2417,19 +2423,21 @@ func (c *client) leafNodeSolicitWSConnection(opts *Options, rURL *url.URL, remot
 		(resp.StatusCode != 101 ||
 			!strings.EqualFold(resp.Header.Get("Upgrade"), "websocket") ||
 			!strings.EqualFold(resp.Header.Get("Connection"), "upgrade") ||
-			resp.Header.Get("Sec-Websocket-Accept") != wsAcceptKey(wsKey)) {
+			resp.Header.Get("Sec-Websocket-Accept") != acceptKey(wsKey)) {
 
 		err = fmt.Errorf("invalid websocket connection")
 	}
 	// Check compression extension...
-	if err == nil && c.ws.compress {
+	// As c.websocketClient is created when the client is initialized, so don't worry it's nil. btw check
+	// it anyway.
+	if err == nil && c.isWebsocket() && c.websocketClient.Ws.Compress {
 		// Check that not only permessage-deflate extension is present, but that
 		// we also have server and client no context take over.
-		srvCompress, noCtxTakeover := wsPMCExtensionSupport(resp.Header, false)
+		srvCompress, noCtxTakeover := websocket.PMCExtensionSupport(resp.Header, false)
 
 		// If server does not support compression, then simply disable it in our side.
 		if !srvCompress {
-			c.ws.compress = false
+			c.websocketClient.Ws.Compress = false
 		} else if !noCtxTakeover {
 			err = fmt.Errorf("compression negotiation error")
 		}
@@ -2437,9 +2445,9 @@ func (c *client) leafNodeSolicitWSConnection(opts *Options, rURL *url.URL, remot
 	// Same for no masking...
 	if err == nil && noMasking {
 		// Check if server accepts no masking
-		if resp.Header.Get(wsNoMaskingHeader) != wsNoMaskingValue {
+		if resp.Header.Get(websocket.NoMaskingHeader) != websocket.NoMaskingValue {
 			// Nope, need to mask our writes as any client would do.
-			c.ws.maskwrite = true
+			c.websocketClient.Ws.Maskwrite = true
 		}
 	}
 	if resp != nil {
@@ -2448,7 +2456,7 @@ func (c *client) leafNodeSolicitWSConnection(opts *Options, rURL *url.URL, remot
 	if err != nil {
 		return nil, ReadError, err
 	}
-	c.Debugf("Leafnode compression=%v masking=%v", c.ws.compress, c.ws.maskwrite)
+	c.Debugf("Leafnode compression=%v masking=%v", c.websocketClient.Ws.Compress, c.websocketClient.Ws.Maskwrite)
 
 	var preBuf []byte
 	// We have to slurp whatever is in the bufio reader and pass that to the readloop.
@@ -2486,7 +2494,7 @@ func (s *Server) leafNodeResumeConnectProcess(c *client) {
 
 		// If TLS required, peform handshake.
 		if tlsRequired {
-			// Get the URL that was used to connect to the remote server.
+			// get the URL that was used to connect to the remote server.
 			rURL := remote.getCurrentURL()
 
 			// Perform the client-side TLS handshake.

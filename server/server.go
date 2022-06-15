@@ -21,6 +21,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/nats-io/nats-server/v2/server/internal/network/websocket"
+	"github.com/nats-io/nats-server/v2/server/internal/util"
 	"io"
 	"io/ioutil"
 	"log"
@@ -157,7 +159,7 @@ type Server struct {
 	leafNodeListenerErr error
 	leafNodeInfo        Info
 	leafNodeInfoJSON    []byte
-	leafURLsMap         refCountedUrlSet
+	leafURLsMap         util.RefCountedUrlSet
 	leafNodeOpts        struct {
 		resolver    netResolver
 		dialTimeout time.Duration
@@ -189,7 +191,7 @@ type Server struct {
 	clientConnectURLs []string
 
 	// Used internally for quick look-ups.
-	clientConnectURLsMap refCountedUrlSet
+	clientConnectURLsMap util.RefCountedUrlSet
 
 	lastCURLsUpdate int64
 
@@ -237,7 +239,7 @@ type Server struct {
 	eventIds *nuid.NUID
 
 	// Websocket structure
-	websocket srvWebsocket
+	websocket websocket.SrvWebsocket
 
 	// MQTT structure
 	mqtt srvMQTT
@@ -445,9 +447,9 @@ func NewServer(opts *Options) (*Server, error) {
 	}
 
 	// Used internally for quick look-ups.
-	s.clientConnectURLsMap = make(refCountedUrlSet)
-	s.websocket.connectURLsMap = make(refCountedUrlSet)
-	s.leafURLsMap = make(refCountedUrlSet)
+	s.clientConnectURLsMap = make(util.RefCountedUrlSet)
+	s.websocket.ConnectURLsMap = make(util.RefCountedUrlSet)
+	s.leafURLsMap = make(util.RefCountedUrlSet)
 
 	// Ensure that non-exported options (used in tests) are properly set.
 	s.setLeafNodeNonExportedOptions()
@@ -646,7 +648,7 @@ func (s *Server) ClientURL() string {
 }
 
 func validateCluster(o *Options) error {
-	if err := validatePinnedCerts(o.Cluster.TLSPinnedCerts); err != nil {
+	if err := ValidatePinnedCerts(o.Cluster.TLSPinnedCerts); err != nil {
 		return fmt.Errorf("cluster: %v", err)
 	}
 	// Check that cluster name if defined matches any gateway name.
@@ -660,7 +662,7 @@ func validateCluster(o *Options) error {
 	return nil
 }
 
-func validatePinnedCerts(pinned PinnedCertSet) error {
+func ValidatePinnedCerts(pinned PinnedCertSet) error {
 	re := regexp.MustCompile("^[a-f0-9]{64}$")
 	for certId := range pinned {
 		entry := strings.ToLower(certId)
@@ -709,7 +711,7 @@ func validateOptions(o *Options) error {
 		return err
 	}
 	// Finally check websocket options.
-	return validateWebsocketOptions(o)
+	return ValidateWebsocketOptions(o)
 }
 
 func (s *Server) getOpts() *Options {
@@ -1800,7 +1802,58 @@ func (s *Server) Start() {
 	// leaf node because we want to resolve the gateway host:port so that this
 	// information can be sent to other routes.
 	if opts.Websocket.Port != 0 {
-		s.startWebsocketServer()
+		sopts := s.getOpts()
+		hasLeaf := sopts.LeafNode.Port != 0
+
+		mux := http.NewServeMux()
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+			res, err := Upgrade(w, r, &s.websocket, sopts.Websocket)
+			//s.websocket.Upgrade(w, r)
+			if err != nil {
+				s.Errorf(err.Error())
+				return
+			}
+			switch res.kind {
+			case CLIENT:
+				_ = s.processWSClient(res.conn, res.ws)
+			case MQTT:
+				s.createMQTTClient(res.conn, res.ws)
+			case LEAF:
+				if !hasLeaf {
+					s.Errorf("Not configured to accept leaf node connections")
+					// Silently close for now. If we want to send an error back, we would
+					// need to create the leafnode client anyway, so that is is handling websocket
+					// frames, then send the error to the remote.
+					res.conn.Close()
+					return
+				}
+				s.createLeafNode(res.conn, nil, nil, res.ws)
+			}
+		})
+		preparedHttpServer := &http.Server{
+			Handler:     mux,
+			ReadTimeout: sopts.Websocket.HandshakeTimeout,
+			ErrorLog:    log.New(&captureHTTPServerLog{s, "websocket: "}, _EMPTY_, 0),
+		}
+
+		err := s.websocket.ProcessSrvWebsocket(preparedHttpServer, &sopts.Websocket)
+		if err != nil {
+			s.Fatalf("process websocket error: %v", err)
+		}
+
+		go func() {
+			if err := s.websocket.Serve(); err != http.ErrServerClosed {
+				s.Fatalf("websocket listener error: %v", err)
+			}
+			if s.isLameDuckMode() {
+				// Signal that we are not accepting new clients
+				s.ldmCh <- true
+				// Now wait for the Shutdown...
+				<-s.quitCh
+				return
+			}
+			s.done <- true
+		}()
 	}
 
 	// Start up listen if we want to accept leaf node connections.
@@ -1934,11 +1987,11 @@ func (s *Server) Shutdown() {
 	}
 
 	// Kick websocket server
-	if s.websocket.server != nil {
+	if s.websocket.Server != nil {
 		doneExpected++
-		s.websocket.server.Close()
-		s.websocket.server = nil
-		s.websocket.listener = nil
+		s.websocket.Server.Close()
+		s.websocket.Server = nil
+		s.websocket.Listener = nil
 	}
 
 	// Kick MQTT accept loop
@@ -2671,21 +2724,21 @@ func (s *Server) updateServerINFOAndSendINFOToClients(curls, wsurls []string, ad
 
 	remove := !add
 	// Will return true if we need alter the server's Info object.
-	updateMap := func(urls []string, m refCountedUrlSet) bool {
+	updateMap := func(urls []string, m util.RefCountedUrlSet) bool {
 		wasUpdated := false
 		for _, url := range urls {
-			if add && m.addUrl(url) {
+			if add && m.AddUrl(url) {
 				wasUpdated = true
-			} else if remove && m.removeUrl(url) {
+			} else if remove && m.RemoveUrl(url) {
 				wasUpdated = true
 			}
 		}
 		return wasUpdated
 	}
 	cliUpdated := updateMap(curls, s.clientConnectURLsMap)
-	wsUpdated := updateMap(wsurls, s.websocket.connectURLsMap)
+	wsUpdated := updateMap(wsurls, s.websocket.ConnectURLsMap)
 
-	updateInfo := func(infoURLs *[]string, urls []string, m refCountedUrlSet) {
+	updateInfo := func(infoURLs *[]string, urls []string, m util.RefCountedUrlSet) {
 		// Recreate the info's slice from the map
 		*infoURLs = (*infoURLs)[:0]
 		// Add this server client connect ULRs first...
@@ -2699,7 +2752,7 @@ func (s *Server) updateServerINFOAndSendINFOToClients(curls, wsurls []string, ad
 		updateInfo(&s.info.ClientConnectURLs, s.clientConnectURLs, s.clientConnectURLsMap)
 	}
 	if wsUpdated {
-		updateInfo(&s.info.WSConnectURLs, s.websocket.connectURLs, s.websocket.connectURLsMap)
+		updateInfo(&s.info.WSConnectURLs, s.websocket.ConnectURLs, s.websocket.ConnectURLsMap)
 	}
 	if cliUpdated || wsUpdated {
 		// Update the time of this update
@@ -2937,7 +2990,7 @@ func (s *Server) readyForConnections(d time.Duration) error {
 		chk["route"] = info{ok: (opts.Cluster.Port == 0 || s.routeListener != nil), err: s.routeListenerErr}
 		chk["gateway"] = info{ok: (opts.Gateway.Name == _EMPTY_ || s.gatewayListener != nil), err: s.gatewayListenerErr}
 		chk["leafNode"] = info{ok: (opts.LeafNode.Port == 0 || s.leafNodeListener != nil), err: s.leafNodeListenerErr}
-		chk["websocket"] = info{ok: (opts.Websocket.Port == 0 || s.websocket.listener != nil), err: s.websocket.listenerErr}
+		chk["websocket"] = info{ok: (opts.Websocket.Port == 0 || s.websocket.Listener != nil), err: s.websocket.ListenerErr}
 		chk["mqtt"] = info{ok: (opts.MQTT.Port == 0 || s.mqtt.listener != nil), err: s.mqtt.listenerErr}
 		s.mu.Unlock()
 
@@ -3104,7 +3157,7 @@ func (s *Server) getNonLocalIPsIfHostIsIPAny(host string, all bool) (bool, []str
 	if !ip.IsUnspecified() {
 		return false, nil, nil
 	}
-	s.Debugf("Get non local IPs for %q", host)
+	s.Debugf("get non local IPs for %q", host)
 	var ips []string
 	ifaces, _ := net.Interfaces()
 	for _, i := range ifaces {
@@ -3192,8 +3245,8 @@ func (s *Server) PortsInfo(maxWait time.Duration) *Ports {
 		httpListener := s.http
 		clusterListener := s.routeListener
 		profileListener := s.profiler
-		wsListener := s.websocket.listener
-		wss := s.websocket.tls
+		wsListener := s.websocket.Listener
+		wss := s.websocket.Tls
 		s.mu.Unlock()
 
 		ports := Ports{}
@@ -3227,9 +3280,9 @@ func (s *Server) PortsInfo(maxWait time.Duration) *Ports {
 		}
 
 		if wsListener != nil {
-			protocol := wsSchemePrefix
+			protocol := websocket.SchemePrefix
 			if wss {
-				protocol = wsSchemePrefixTLS
+				protocol = websocket.SchemePrefixTLS
 			}
 			ports.WebSocket = formatURL(protocol, wsListener)
 		}
@@ -3338,7 +3391,7 @@ func (s *Server) serviceListeners() []net.Listener {
 		listeners = append(listeners, s.profiler)
 	}
 	if opts.Websocket.Port != 0 {
-		listeners = append(listeners, s.websocket.listener)
+		listeners = append(listeners, s.websocket.Listener)
 	}
 	return listeners
 }
@@ -3364,11 +3417,11 @@ func (s *Server) lameDuckMode() {
 	expected := 1
 	s.listener.Close()
 	s.listener = nil
-	if s.websocket.server != nil {
+	if s.websocket.Server != nil {
 		expected++
-		s.websocket.server.Close()
-		s.websocket.server = nil
-		s.websocket.listener = nil
+		s.websocket.Server.Close()
+		s.websocket.Server = nil
+		s.websocket.Listener = nil
 	}
 	s.ldmCh = make(chan bool, expected)
 	opts := s.getOpts()
@@ -3496,8 +3549,8 @@ func (s *Server) sendLDMToClients() {
 	s.info.LameDuckMode = true
 	// Clear this so that if there are further updates, we don't send our URLs.
 	s.clientConnectURLs = s.clientConnectURLs[:0]
-	if s.websocket.connectURLs != nil {
-		s.websocket.connectURLs = s.websocket.connectURLs[:0]
+	if s.websocket.ConnectURLs != nil {
+		s.websocket.ConnectURLs = s.websocket.ConnectURLs[:0]
 	}
 	// Reset content first.
 	s.info.ClientConnectURLs = s.info.ClientConnectURLs[:0]
@@ -3507,7 +3560,7 @@ func (s *Server) sendLDMToClients() {
 		for url := range s.clientConnectURLsMap {
 			s.info.ClientConnectURLs = append(s.info.ClientConnectURLs, url)
 		}
-		for url := range s.websocket.connectURLsMap {
+		for url := range s.websocket.ConnectURLsMap {
 			s.info.WSConnectURLs = append(s.info.WSConnectURLs, url)
 		}
 	}
